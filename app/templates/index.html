@@ -57,14 +57,14 @@
   <section class="card">
     <h2>1. 选择本地带卷</h2>
     <table>
-      <thead><tr><th>带卷</th><th>磁带数</th><th>镜像块</th><th>预估读带/暂存</th><th>上次成品</th><th></th></tr></thead>
+      <thead><tr><th>带卷</th><th>磁带数</th><th>镜像块</th><th>参考估算 读带/暂存</th><th>上次成品</th><th></th></tr></thead>
       <tbody>
       {% for s in sets %}
         <tr>
           <td><code>{{ s.name }}</code></td>
           <td>{{ s.tape_count }}</td>
           <td>{{ s.block_count }}</td>
-          <td>{{ s.estimate.blocks_read }} / {{ s.estimate.staging_peak }} 块</td>
+          <td><span title="贪心读法（提前块全部暂存）的单一读法估算，仅供参考；实际可行性由清单预演按所填额度判定">参考 {{ s.estimate.blocks_read }} / {{ s.estimate.staging_peak }} 块</span></td>
           <td>
             {% if s.has_artifact %}
               <span class="pill ok">{{ s.artifact_size }} B</span>
@@ -83,7 +83,7 @@
       {% endfor %}
       </tbody>
     </table>
-    <p class="hint">预估值按“提前读到的块全部暂存”的贪心策略计算，是该布局下的额度下限。</p>
+    <p class="hint">参考估算只对应“提前读到的块全部暂存”的单一贪心读法，是额度下限的参考值，不是可行性判据；开带前会按所填额度只凭清单做预演，无解时不会读带。</p>
   </section>
 
   <section class="card">
@@ -124,12 +124,37 @@
     </h2>
 
     {% if job.error %}
-      <div class="err">错误：{{ job.error }}（上次成品已保留，未被覆盖）</div>
+      {% if job.failure_kind == 'quota' %}
+        <div class="err" style="background:#fff8c5;border-color:#d4a72c;color:var(--warn)">
+          额度不足（清单预演，本次未读带）：{{ job.error }}<br>
+          上次成品已保留，未被覆盖。
+        </div>
+      {% elif job.failure_kind == 'bad_block' %}
+        <div class="err">
+          实读发现坏块（SHA-256 核对失败）：{{ job.error }}<br>
+          上次成品已保留，未被覆盖。
+        </div>
+      {% else %}
+        <div class="err">错误：{{ job.error }}（上次成品已保留，未被覆盖）</div>
+      {% endif %}
+    {% endif %}
+
+    {% if job.running and job.live_metrics %}
+    <div class="metrics">
+      <div class="metric"><b id="live-reads">{{ job.live_metrics.blocks_read }}</b><span>本次实读块数（进行中）</span></div>
+      <div class="metric"><b id="live-peak">{{ job.live_metrics.staging_peak }}</b><span>暂存峰值（块，进行中）</span></div>
+      <div class="metric"><b id="live-switches">{{ job.live_metrics.tape_switches }}</b><span>换带次数</span></div>
+      <div class="metric"><b id="live-rewinds">{{ job.live_metrics.rewinds }}</b><span>回卷次数</span></div>
+    </div>
     {% endif %}
 
     {% if job.result %}
+    <p class="hint" style="margin:4px 0 8px">
+      失败分类：{{ job.result.failure_label }}
+      {% if job.result.failure_kind == 'quota' %}（开带前清单预演判定，未产生读带量）{% endif %}
+    </p>
     <div class="metrics">
-      <div class="metric"><b>{{ job.result.metrics.blocks_read }}</b><span>实际读带块数</span></div>
+      <div class="metric"><b>{{ job.result.metrics.blocks_read }}</b><span>本次实读块数</span></div>
       <div class="metric"><b>{{ job.result.metrics.staging_peak }}</b><span>暂存峰值（块）</span></div>
       <div class="metric"><b>{{ job.result.blocks_written }}</b><span>已写入镜像块</span></div>
       <div class="metric"><b>{{ job.result.metrics.tape_switches }}</b><span>换带次数</span></div>
@@ -153,6 +178,14 @@
     const job = await resp.json();
     const pre = document.getElementById("events");
     pre.textContent = (job.events || []).join("\n");
+    const m = job.live_metrics;
+    if (m) {
+      const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+      set("live-reads", m.blocks_read);
+      set("live-peak", m.staging_peak);
+      set("live-switches", m.tape_switches);
+      set("live-rewinds", m.rewinds);
+    }
     if (!job.running) {
       clearInterval(pollTimer);
       setTimeout(() => window.location.reload(), 1200);

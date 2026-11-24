@@ -2,9 +2,13 @@
 
 页面能力：
 
-* 列出本地带卷目录中的全部合法带卷，并给出贪心策略下的额度预估；
+* 列出本地带卷目录中的全部合法带卷，并给出贪心读法的额度参考估算
+  （标注“参考”：仅单一读法，不代表可行性判据）；
 * 选择一套带卷，填写读带块数上限与暂存块数上限后启动恢复演练；
-* 恢复在后台线程执行，页面轮询展示实际读带块数、暂存峰值与事件流；
+* **开带前只凭清单做额度预演**：额度组合无可行解时任务直接失败，
+  一次带都不读，页面归类为“额度不足（预演）”；
+* 恢复在后台线程执行，页面轮询展示本次实读块数、暂存峰值与事件流；
+  实读阶段发现的 SHA-256 坏块单独归类为“坏块（实读）”；
 * 恢复中仍可下载上一次成品；成功后原子替换成品，失败（坏块/额度不足）
   则报错并保留上一次成品不变。
 """
@@ -27,11 +31,24 @@ from flask import (
     url_for,
 )
 
-from .engine import FileImageSink, RecoveryResult, baseline, simulate_recovery
+from .engine import (
+    FileImageSink,
+    KIND_BAD_BLOCK,
+    KIND_OTHER,
+    KIND_QUOTA,
+    RecoveryResult,
+    baseline,
+    simulate_recovery,
+)
 from .storage import ManifestError, discover_sets, load_set
 
 ARTIFACT_NAME = "image.bin"
 MAX_EVENTS = 200
+_FAILURE_LABELS = {
+    KIND_QUOTA: "额度不足（清单预演，未读带）",
+    KIND_BAD_BLOCK: "坏块（实读发现，SHA-256 不符）",
+    KIND_OTHER: "恢复失败",
+}
 
 
 @dataclass
@@ -45,6 +62,8 @@ class JobState:
     result: dict[str, Any] | None = None
     events: list[str] = field(default_factory=list)
     error: str | None = None
+    failure_kind: str | None = None
+    live_metrics: dict[str, Any] | None = None
 
 
 def create_app(
@@ -77,6 +96,9 @@ def create_app(
         out_dir = os.path.join(output_root, set_name)
         os.makedirs(out_dir, exist_ok=True)
         tmp_path = os.path.join(out_dir, ARTIFACT_NAME + ".part")
+        # 提前块落盘暂存目录：与内存暂存等价，统一计入暂存块数。
+        staging_dir = os.path.join(out_dir, "staging")
+        os.makedirs(staging_dir, exist_ok=True)
         try:
             tape_set = load_set(tape_root, set_name)
             sink = FileImageSink(tmp_path)
@@ -84,13 +106,25 @@ def create_app(
             def on_sleep(_delay: float) -> None:
                 time.sleep(_delay)
 
+            def on_progress(metrics: Any) -> None:
+                with lock:
+                    state.live_metrics = {
+                        "blocks_read": metrics.blocks_read,
+                        "staging_peak": metrics.staging_peak,
+                        "tape_switches": metrics.tape_switches,
+                        "rewinds": metrics.rewinds,
+                    }
+                    state.events = list(metrics.events[-MAX_EVENTS:])
+
             result: RecoveryResult = simulate_recovery(
                 tape_set,
                 read_quota,
                 staging_quota,
                 sink=sink,
+                staging_dir=staging_dir,
                 read_delay=read_delay,
                 sleep=on_sleep,
+                progress=on_progress,
             )
             with lock:
                 state.events = list(result.metrics.events[-MAX_EVENTS:])
@@ -104,12 +138,19 @@ def create_app(
                         os.remove(tmp_path)
                 state.result = _result_to_dict(result)
                 state.error = result.error
+                state.failure_kind = result.failure_kind
         except Exception as exc:  # noqa: BLE001 - 线程内兜底，错误回传页面
             with lock:
                 state.error = f"恢复任务异常: {exc}"
+                state.failure_kind = KIND_OTHER
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
         finally:
+            # 暂存目录内容由引擎逐块清理；这里兜底删空目录。
+            try:
+                os.rmdir(staging_dir)
+            except OSError:
+                pass
             with lock:
                 state.running = False
                 state.finished_at = time.time()
@@ -119,6 +160,10 @@ def create_app(
             "success": result.success,
             "set_name": result.set_name,
             "error": result.error,
+            "failure_kind": result.failure_kind,
+            "failure_label": _FAILURE_LABELS.get(
+                result.failure_kind, _FAILURE_LABELS[KIND_OTHER]
+            ),
             "blocks_written": result.blocks_written,
             "metrics": asdict(result.metrics) | {"events": []},
             "artifact_path": result.artifact_path,
@@ -147,6 +192,9 @@ def create_app(
                 "staging_quota": state.staging_quota,
                 "result": state.result,
                 "error": state.error,
+                "failure_kind": state.failure_kind,
+                "failure_label": _FAILURE_LABELS.get(state.failure_kind),
+                "live_metrics": state.live_metrics,
                 "events": list(state.events),
             }
         return render_template("index.html", sets=sets, job=job)
@@ -176,8 +224,10 @@ def create_app(
             state.started_at = time.time()
             state.finished_at = 0.0
             state.result = None
-            state.events = ["任务已提交，开始恢复演练…"]
+            state.live_metrics = None
+            state.events = ["任务已提交，正在按清单做额度预演…"]
             state.error = None
+            state.failure_kind = None
 
         thread = threading.Thread(
             target=run_recovery,
@@ -197,6 +247,9 @@ def create_app(
                 "staging_quota": state.staging_quota,
                 "result": state.result,
                 "error": state.error,
+                "failure_kind": state.failure_kind,
+                "failure_label": _FAILURE_LABELS.get(state.failure_kind),
+                "live_metrics": state.live_metrics,
                 "events": list(state.events),
             }
 
